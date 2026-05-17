@@ -33,6 +33,72 @@
             }
         })();
     </script>
+
+<style>
+/* === ANIMA PROGRESS BAR PATCH === */
+.job-item {
+    position: relative;
+}
+
+.job-progress-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 4px;
+    font-size: 0.7rem;
+}
+
+.job-progress-bar {
+    flex: 1;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.job-progress-fill {
+    height: 100%;
+    background: var(--accent, #4a90e2);
+    transition: width 0.3s ease;
+}
+
+.job-progress-text {
+    color: var(--text-muted, #888);
+    font-variant-numeric: tabular-nums;
+    min-width: 30px;
+    text-align: right;
+}
+
+.job-status-label {
+    display: inline-block;
+    margin-top: 4px;
+    font-size: 0.7rem;
+    padding: 1px 6px;
+    border-radius: 3px;
+}
+
+.job-status-completed {
+    color: #4ade80;
+    background: rgba(74, 222, 128, 0.1);
+}
+
+.job-status-failed {
+    color: #ef4444;
+    background: rgba(239, 68, 68, 0.1);
+}
+
+.job-status-awaiting {
+    color: #fbbf24;
+    background: rgba(251, 191, 36, 0.1);
+}
+
+.job-status-idle {
+    color: var(--text-muted, #888);
+    background: rgba(128, 128, 128, 0.08);
+}
+/* === END ANIMA PROGRESS BAR PATCH === */
+</style>
+
 </head>
 
 <body>
@@ -68,6 +134,9 @@
                         <button id="btn-save" class="btn btn-success hidden">💾 Save</button>
                         <button id="btn-discard" class="btn btn-danger hidden">Discard</button>
                         <button id="btn-clone" class="btn btn-secondary">Clone</button>
+                        <button id="btn-queue" class="btn btn-secondary">+ Queue</button>
+                        <button id="btn-sync-job-final" class="btn btn-secondary" title="Copy final LoRA to ComfyUI">📦 Final</button>
+                        <button id="btn-sync-job-all" class="btn btn-secondary" title="Copy final + all step checkpoints">📦 All</button>
                         <button id="btn-run" class="btn btn-primary">▶ Train</button>
                         <button id="btn-stop" class="btn btn-danger hidden">⏹ Stop</button>
                         <button id="btn-delete" class="btn btn-danger" title="Delete">🗑</button>
@@ -84,6 +153,7 @@
                     <button class="tab" data-tab="samples">Samples</button>
                     <button class="tab" data-tab="console">Console</button>
                     <button class="tab" data-tab="tensorboard">📊 TensorBoard</button>
+                    <button class="tab" data-tab="queue">📋 Queue</button>
                     <button class="tab" data-tab="settings">⚙️</button>
                 </div>
 
@@ -953,6 +1023,22 @@
                         </div>
                     </div>
 
+                    <!-- Queue Tab -->
+                    <div id="tab-queue" class="tab-pane hidden">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+                            <h4 style="margin:0;">Training Queue</h4>
+                            <button id="btn-queue-clear" class="btn btn-danger btn-sm">🗑 Clear All</button>
+                        </div>
+                        <div id="queue-status-bar" style="margin-bottom:12px; font-size:0.85rem; color:var(--text-muted);">
+                            Queue is empty.
+                        </div>
+                        <div id="queue-list" style="display:none; flex-direction:column; gap:8px;"></div>
+                        <div id="queue-empty" style="text-align:center; padding:40px; color:var(--text-muted);">
+                            <p>No jobs queued. Click <strong>+ Queue</strong> on any job to add it here.</p>
+                            <small>Jobs run one after another automatically when the current training finishes.</small>
+                        </div>
+                    </div>
+
                     <!-- Settings Tab -->
                     <div id="tab-settings" class="tab-pane hidden">
                         <h4>Job Maintenance</h4>
@@ -1040,6 +1126,27 @@
                         <small>Path to the Python virtual environment with training dependencies.</small>
                     </div>
 
+                    <!-- LORA SYNC V2 START -->
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label>LoRA Sync Destination</label>
+                        <input type="text" id="cfg-global-lora-sync-dest" placeholder="H:\ComfyUI_windows_portable\ComfyUI\models\loras\Anima">
+                        <small>Folder where trained LoRAs will be copied.</small>
+                    </div>
+                    <div class="form-group" style="margin-top: 10px;">
+                        <label><input type="checkbox" id="cfg-global-lora-sync-subfolder"> Create subfolder per job</label>
+                        <small>If on, each job's files go into &lt;destination&gt;\&lt;jobname&gt;\.</small>
+                    </div>
+                    <div class="form-group" style="margin-top: 15px; display:flex; gap:8px; flex-wrap:wrap;">
+                        <button id="btn-sync-all-final" class="btn btn-primary">📦 Sync All (Final only)</button>
+                        <button id="btn-sync-all-everything" class="btn btn-primary">📦 Sync All (Everything)</button>
+                    </div>
+                    <small style="display:block; margin-top:6px;">"Final only" copies just &lt;jobname&gt;.safetensors. "Everything" also includes step checkpoints.</small>
+                    <!-- LORA SYNC V2 END -->
+
+                    <div style="display:none;">
+                        <small>Path to the Python virtual environment with training dependencies.</small>
+                    </div>
+
                     <div class="form-group" style="margin-top: 15px;">
                         <label>Theme</label>
                         <select id="cfg-theme">
@@ -1108,6 +1215,18 @@
     </div>
 
     <script src="js/app.js"></script>
+
+<!-- OUTPUT PRECHECK MODAL -->
+<div id="modal-output-precheck" class="modal" style="display:none;">
+    <div class="modal-content" style="max-width:560px;">
+        <h3 id="precheck-title">Output Folder Contents Found</h3>
+        <p id="precheck-message" style="margin:12px 0;">The output folder contains existing files. Running training without clearing may cause failure.</p>
+        <div id="precheck-job-list" style="max-height:200px; overflow-y:auto; margin:10px 0; padding:8px; background:var(--bg-secondary); border-radius:6px; font-size:0.85rem; display:none;"></div>
+        <div id="precheck-actions" style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; margin-top:16px;"></div>
+    </div>
+</div>
+<!-- END OUTPUT PRECHECK MODAL -->
+
 </body>
 
 </html>

@@ -79,6 +79,17 @@ function connectWS() {
         updateHwMonitor(msg.data);
         return;
       }
+      if (msg.type === "job_progress") {
+        if (msg.data && msg.data.name) {
+          window._jobStates[msg.data.name] = msg.data;
+          if (typeof _applyAllJobStates === 'function') _applyAllJobStates();
+        }
+        return;
+      }
+      if (msg.type === "queue_update") {
+        renderQueue(msg.data);
+        return;
+      }
       if (msg.job !== currentJob) return;
       if (msg.type === "log") {
         appendConsole(msg.data);
@@ -3356,6 +3367,660 @@ document.addEventListener("input", (e) => {
     renderProgressivePhases();
   }
 });
+
+
+// === ANIMA QUEUE PATCH ===
+async function loadQueue() {
+  try {
+    const queue = await api('/api/queue');
+    renderQueue(queue);
+  } catch (e) { console.error('Failed to load queue:', e); }
+}
+
+function renderQueue(queue) {
+  const list = $('queue-list');
+  const empty = $('queue-empty');
+  const statusBar = $('queue-status-bar');
+  if (!list) return;
+  if (!queue || queue.length === 0) {
+    list.innerHTML = '';
+    list.style.display = 'none';
+    if (empty) empty.style.display = 'block';
+    if (statusBar) statusBar.textContent = 'Queue is empty.';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  list.style.display = 'flex';
+  if (statusBar) statusBar.textContent = queue.length + ' job(s) queued - will run automatically in order.';
+  list.innerHTML = '';
+  queue.forEach((jobName, idx) => {
+    const item = document.createElement('div');
+    item.draggable = true;
+    item.dataset.job = jobName;
+    item.style.cssText = 'display:flex; align-items:center; gap:12px; padding:10px 14px; border-radius:8px; background:var(--bg-secondary); border:1px solid var(--border); cursor:grab;';
+    item.innerHTML = '<span style="color:var(--text-muted); font-size:0.8rem; min-width:20px;">' + (idx + 1) + '</span><span style="flex:1; font-weight:500;">' + escapeHtml(jobName) + '</span><button class="btn btn-ghost btn-sm btn-queue-remove" title="Remove from queue" style="color:var(--danger);">✕</button>';
+    item.querySelector('.btn-queue-remove').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await api('/api/queue/' + encodeURIComponent(jobName), { method: 'DELETE' });
+      loadQueue();
+      showToast('Removed "' + jobName + '" from queue');
+    });
+    item.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('text/plain', jobName);
+      item.style.opacity = '0.4';
+    });
+    item.addEventListener('dragend', () => { item.style.opacity = '1'; });
+    item.addEventListener('dragover', (e) => { e.preventDefault(); item.style.borderColor = 'var(--accent)'; });
+    item.addEventListener('dragleave', () => { item.style.borderColor = 'var(--border)'; });
+    item.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      item.style.borderColor = 'var(--border)';
+      const draggedJob = e.dataTransfer.getData('text/plain');
+      if (draggedJob === jobName) return;
+      const items = Array.from(list.querySelectorAll('[data-job]')).map(el => el.dataset.job);
+      const fromIdx = items.indexOf(draggedJob);
+      const toIdx = items.indexOf(jobName);
+      if (fromIdx === -1 || toIdx === -1) return;
+      items.splice(fromIdx, 1);
+      items.splice(toIdx, 0, draggedJob);
+      await api('/api/queue', { method: 'PUT', body: { queue: items } });
+      loadQueue();
+    });
+    list.appendChild(item);
+  });
+}
+
+async function addToQueue() {
+  if (!currentJob) return;
+  try {
+    await api('/api/queue', { method: 'POST', body: { name: currentJob } });
+    showToast('"' + currentJob + '" added to queue');
+    const queueTab = document.querySelector('[data-tab="queue"]');
+    if (queueTab) queueTab.click();
+  } catch (err) {
+    showToast('Error: ' + err.message, 'danger');
+  }
+}
+
+// Hook up the buttons once DOM is ready
+(function attachQueueButtons() {
+  function attach() {
+    const btnQueue = document.getElementById('btn-queue');
+    const btnClear = document.getElementById('btn-queue-clear');
+    if (btnQueue && !btnQueue._queueBound) {
+      btnQueue.addEventListener('click', addToQueue);
+      btnQueue._queueBound = true;
+    }
+    if (btnClear && !btnClear._queueBound) {
+      btnClear.addEventListener('click', () => {
+        showConfirm('Clear Queue', 'Remove all jobs from the queue?', async () => {
+          await api('/api/queue', { method: 'DELETE' });
+          loadQueue();
+          showToast('Queue cleared');
+        });
+      });
+      btnClear._queueBound = true;
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', attach);
+  } else {
+    attach();
+  }
+  // Load initial queue state after a short delay to make sure WS is connected
+  setTimeout(loadQueue, 1000);
+})();
+// === END ANIMA QUEUE PATCH ===
+
+
+// === ANIMA LORA SYNC V2 PATCH ===
+async function _confirmSubfolderForAllMode() {
+  // Returns: 'subfolder' | 'flat' | 'cancel'
+  return new Promise(resolve => {
+    const title = "Use subfolder for this sync?";
+    const msg = "You're copying multiple step checkpoints with a flat destination. " +
+                "Would you like to put them in a subfolder named after the job instead? " +
+                "This keeps step files from different jobs organized.";
+    // Build a custom confirm modal with 3 buttons
+    const titleEl = document.getElementById("confirm-title");
+    const msgEl = document.getElementById("confirm-message");
+    const actions = document.getElementById("confirm-actions");
+    if (!titleEl || !msgEl || !actions) {
+      // Fallback to a basic confirm
+      const r = confirm(msg + "\n\nOK = use subfolder, Cancel = copy flat");
+      resolve(r ? 'subfolder' : 'flat');
+      return;
+    }
+    titleEl.textContent = title;
+    msgEl.textContent = msg;
+    actions.innerHTML = "";
+
+    const mkBtn = (label, cls, value) => {
+      const b = document.createElement("button");
+      b.className = "btn " + cls;
+      b.textContent = label;
+      b.onclick = () => { closeModal("modal-confirm"); resolve(value); };
+      return b;
+    };
+
+    actions.appendChild(mkBtn("Cancel", "btn-ghost", "cancel"));
+    actions.appendChild(mkBtn("Copy flat", "btn-secondary", "flat"));
+    actions.appendChild(mkBtn("Use subfolder", "btn-primary", "subfolder"));
+    openModal("modal-confirm");
+  });
+}
+
+async function _shouldUseSubfolderForAllMode() {
+  // Check global setting first
+  try {
+    const cfg = await api('/api/global-config');
+    if (cfg.lora_sync_create_subfolder) {
+      return { use: true, cancelled: false };
+    }
+    // Global is off - ask the user
+    const choice = await _confirmSubfolderForAllMode();
+    if (choice === 'cancel') return { use: false, cancelled: true };
+    return { use: choice === 'subfolder', cancelled: false };
+  } catch (e) {
+    return { use: false, cancelled: false };
+  }
+}
+
+async function syncOneJobFinal() {
+  if (!currentJob) return;
+  try {
+    const result = await api(`/api/jobs/${encodeURIComponent(currentJob)}/sync`, {
+      method: 'POST',
+      body: { mode: 'final' }
+    });
+    if (result.copied && result.copied.length > 0) {
+      const sizeMB = (result.copied[0].size / 1024 / 1024).toFixed(1);
+      showToast(`Copied ${result.copied[0].name} (${sizeMB} MB)`);
+    } else if (result.skipped && result.skipped.length > 0) {
+      showToast(`Already exists at destination`);
+    } else if (result.missing) {
+      showToast(`No final .safetensors found`, 'warning');
+    } else {
+      showToast(`Sync done`);
+    }
+  } catch (err) {
+    showToast(`Sync failed: ${err.message}`, 'danger');
+  }
+}
+
+async function syncOneJobAll() {
+  if (!currentJob) return;
+  const subfolderChoice = await _shouldUseSubfolderForAllMode();
+  if (subfolderChoice.cancelled) return;
+  try {
+    const result = await api(`/api/jobs/${encodeURIComponent(currentJob)}/sync`, {
+      method: 'POST',
+      body: { mode: 'all', use_subfolder: subfolderChoice.use }
+    });
+    if (result.copied && result.copied.length > 0) {
+      showToast(`Copied ${result.copied.length} file(s)` + (result.skipped.length ? `, skipped ${result.skipped.length}` : ''));
+    } else if (result.skipped && result.skipped.length > 0) {
+      showToast(`All ${result.skipped.length} file(s) already at destination`);
+    } else if (result.missing) {
+      showToast(`No matching files found`, 'warning');
+    } else {
+      showToast(`Nothing to do`);
+    }
+  } catch (err) {
+    showToast(`Sync failed: ${err.message}`, 'danger');
+  }
+}
+
+async function _showSyncAllSummary(result) {
+  const lines = [];
+  lines.push(`Mode: ${result.mode === 'final' ? 'Final only' : 'Everything (final + steps)'}`);
+  lines.push(`Destination: ${result.destination}`);
+  lines.push(`Subfolders: ${result.useSubfolder ? 'yes' : 'no'}`);
+  lines.push(``);
+  lines.push(`Files copied:        ${result.totals.copied}`);
+  lines.push(`Skipped (existed):   ${result.totals.skipped}`);
+  lines.push(`Jobs missing files:  ${result.totals.missing}`);
+  lines.push(`Errors:              ${result.totals.errors}`);
+
+  const failedJobs = result.jobs.filter(j => j.status === 'missing');
+  if (failedJobs.length > 0) {
+    lines.push(``);
+    lines.push(`MISSING:`);
+    failedJobs.forEach(j => lines.push(`  ${j.name}`));
+  }
+  const errJobs = result.jobs.filter(j => j.errors && j.errors.length > 0);
+  if (errJobs.length > 0) {
+    lines.push(``);
+    lines.push(`ERRORS:`);
+    errJobs.forEach(j => j.errors.forEach(e => lines.push(`  ${j.name}: ${e.error}`)));
+  }
+  alert(lines.join('\n'));
+}
+
+async function syncAllFinal() {
+  showConfirm(
+    'Sync All (Final only)',
+    'Copy every job\'s FINAL .safetensors to the destination? Files already present will be skipped.',
+    async () => {
+      const btn = document.getElementById('btn-sync-all-final');
+      if (btn) { btn.disabled = true; btn.textContent = '⏳ Syncing...'; }
+      try {
+        const result = await api('/api/sync-all', { method: 'POST', body: { mode: 'final' } });
+        await _showSyncAllSummary(result);
+      } catch (err) {
+        alert('Sync failed: ' + err.message);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '📦 Sync All (Final only)'; }
+      }
+    }
+  );
+}
+
+async function syncAllEverything() {
+  // For "Everything" mode, check subfolder preference up front (one decision applied to all jobs)
+  const subfolderChoice = await _shouldUseSubfolderForAllMode();
+  if (subfolderChoice.cancelled) return;
+
+  showConfirm(
+    'Sync All (Everything)',
+    'Copy every job\'s FINAL + ALL STEP CHECKPOINTS to the destination? This can be many files. Files already present will be skipped.',
+    async () => {
+      const btn = document.getElementById('btn-sync-all-everything');
+      if (btn) { btn.disabled = true; btn.textContent = '⏳ Syncing...'; }
+      try {
+        const result = await api('/api/sync-all', {
+          method: 'POST',
+          body: { mode: 'all', use_subfolder: subfolderChoice.use }
+        });
+        await _showSyncAllSummary(result);
+      } catch (err) {
+        alert('Sync failed: ' + err.message);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '📦 Sync All (Everything)'; }
+      }
+    }
+  );
+}
+
+// Wire all sync buttons + load/save settings in global config modal
+(function attachSyncV2Buttons() {
+  function attach() {
+    const bf = document.getElementById('btn-sync-job-final');
+    if (bf && !bf._syncBound) { bf.addEventListener('click', syncOneJobFinal); bf._syncBound = true; }
+
+    const ba = document.getElementById('btn-sync-job-all');
+    if (ba && !ba._syncBound) { ba.addEventListener('click', syncOneJobAll); ba._syncBound = true; }
+
+    const bAllFinal = document.getElementById('btn-sync-all-final');
+    if (bAllFinal && !bAllFinal._syncBound) { bAllFinal.addEventListener('click', syncAllFinal); bAllFinal._syncBound = true; }
+
+    const bAllAll = document.getElementById('btn-sync-all-everything');
+    if (bAllAll && !bAllAll._syncBound) { bAllAll.addEventListener('click', syncAllEverything); bAllAll._syncBound = true; }
+
+    const btnGlobalSettings = document.getElementById('btn-global-settings');
+    if (btnGlobalSettings && !btnGlobalSettings._syncBound) {
+      btnGlobalSettings.addEventListener('click', () => {
+        setTimeout(async () => {
+          try {
+            const cfg = await api('/api/global-config');
+            const destInput = document.getElementById('cfg-global-lora-sync-dest');
+            if (destInput) destInput.value = cfg.lora_sync_destination || '';
+            const subCheck = document.getElementById('cfg-global-lora-sync-subfolder');
+            if (subCheck) subCheck.checked = !!cfg.lora_sync_create_subfolder;
+          } catch (e) { console.error('Could not load sync settings', e); }
+        }, 200);
+      });
+      btnGlobalSettings._syncBound = true;
+    }
+
+    const btnSaveGlobal = document.getElementById('btn-save-global');
+    if (btnSaveGlobal && !btnSaveGlobal._syncBound) {
+      btnSaveGlobal.addEventListener('click', () => {
+        setTimeout(async () => {
+          try {
+            const destInput = document.getElementById('cfg-global-lora-sync-dest');
+            const subCheck = document.getElementById('cfg-global-lora-sync-subfolder');
+            const cfg = await api('/api/global-config');
+            if (destInput) cfg.lora_sync_destination = destInput.value;
+            if (subCheck) cfg.lora_sync_create_subfolder = !!subCheck.checked;
+            await api('/api/global-config', { method: 'PUT', body: cfg });
+          } catch (e) { console.error('Could not save sync settings', e); }
+        }, 300);
+      });
+      btnSaveGlobal._syncBound = true;
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', attach);
+  } else {
+    attach();
+  }
+})();
+// === END ANIMA LORA SYNC V2 PATCH ===
+
+
+// === ANIMA OUTPUT PRECHECK PATCH ===
+async function _checkJobOutput(jobName) {
+    try {
+        return await api('/api/jobs/' + encodeURIComponent(jobName) + '/output-status');
+    } catch (e) {
+        console.warn('output-status check failed:', e);
+        return { exists: false, file_count: 0, files: [] };
+    }
+}
+
+async function _clearJobOutput(jobName) {
+    try {
+        return await api('/api/jobs/' + encodeURIComponent(jobName) + '/clear-output', { method: 'POST' });
+    } catch (e) {
+        console.warn('clear-output failed:', e);
+        return { success: false, error: e.message };
+    }
+}
+
+function _showPrecheckModal(title, message, buttons, jobList) {
+    return new Promise(resolve => {
+        const titleEl = document.getElementById('precheck-title');
+        const msgEl = document.getElementById('precheck-message');
+        const actionsEl = document.getElementById('precheck-actions');
+        const listEl = document.getElementById('precheck-job-list');
+        const modal = document.getElementById('modal-output-precheck');
+        if (!titleEl || !msgEl || !actionsEl || !modal) {
+            const confirmed = confirm(title + '\n\n' + message);
+            resolve(confirmed ? buttons[0].value : 'cancel');
+            return;
+        }
+        titleEl.textContent = title;
+        msgEl.textContent = message;
+        actionsEl.innerHTML = '';
+
+        if (jobList && jobList.length > 0 && listEl) {
+            listEl.innerHTML = jobList.map(j => '<div>• ' + escapeHtml(j.name) + ' (' + j.file_count + ' file' + (j.file_count !== 1 ? 's' : '') + ')</div>').join('');
+            listEl.style.display = 'block';
+        } else if (listEl) {
+            listEl.style.display = 'none';
+        }
+
+        for (const btn of buttons) {
+            const b = document.createElement('button');
+            b.className = 'btn ' + (btn.cls || 'btn-secondary');
+            b.textContent = btn.label;
+            b.onclick = () => {
+                modal.style.display = 'none';
+                resolve(btn.value);
+            };
+            actionsEl.appendChild(b);
+        }
+
+        modal.style.display = 'flex';
+    });
+}
+
+// Wrap the existing run button to add the precheck
+async function _runWithPrecheck(originalRunFn) {
+    if (!currentJob) {
+        if (typeof originalRunFn === 'function') return originalRunFn();
+        return;
+    }
+
+    const status = await _checkJobOutput(currentJob);
+    if (!status.exists || status.file_count === 0) {
+        // Nothing stale, run normally
+        if (typeof originalRunFn === 'function') return originalRunFn();
+        return;
+    }
+
+    // Show single-job prompt
+    const choice = await _showPrecheckModal(
+        'Output Folder Contents Found',
+        'The output folder for "' + currentJob + '" contains ' + status.file_count + ' existing file' + (status.file_count !== 1 ? 's' : '') + '. Running training without clearing may cause failure.',
+        [
+            { label: 'Cancel', cls: 'btn-ghost', value: 'cancel' },
+            { label: 'Train Anyway', cls: 'btn-secondary', value: 'keep' },
+            { label: 'Clear & Train', cls: 'btn-primary', value: 'clear' },
+        ],
+        null
+    );
+
+    if (choice === 'cancel') {
+        showToast('Training cancelled.');
+        return;
+    }
+    if (choice === 'clear') {
+        const r = await _clearJobOutput(currentJob);
+        showToast('Cleared ' + (r.deleted || 0) + ' file(s) from output folder.');
+    }
+    if (typeof originalRunFn === 'function') return originalRunFn();
+}
+
+// Hook into the Train button
+(function attachPrecheckToTrainButton() {
+    function attach() {
+        const btn = document.getElementById('btn-run');
+        if (!btn || btn._precheckBound) return;
+        // Remove existing click handlers by cloning the button
+        const newBtn = btn.cloneNode(true);
+        btn.parentNode.replaceChild(newBtn, btn);
+        newBtn._precheckBound = true;
+
+        // Find and re-attach the original train handler with precheck wrapping
+        newBtn.addEventListener('click', async () => {
+            await _runWithPrecheck(async () => {
+                // Call the original train function
+                if (typeof startTraining === 'function') {
+                    return startTraining();
+                }
+                // Fallback: direct API call
+                try {
+                    await api('/api/jobs/' + encodeURIComponent(currentJob) + '/train/start', { method: 'POST' });
+                    showToast('Training started');
+                } catch (err) {
+                    showToast('Failed to start: ' + err.message, 'danger');
+                }
+            });
+        });
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', attach);
+    else attach();
+    // Re-attach after a delay in case the UI re-renders
+    setTimeout(attach, 1500);
+})();
+
+// Queue start hook - intercept addToQueue to handle bulk precheck
+window._queuePrecheckState = {
+    decisions: {}, // jobName -> 'clear' | 'keep'
+    mode: null, // 'all_clear' | 'all_keep' | 'per_job' | null
+};
+
+async function _runQueuePrecheck() {
+    try {
+        const status = await api('/api/queue/output-status');
+        if (!status.stale_jobs || status.stale_jobs.length === 0) {
+            return 'proceed';
+        }
+
+        const choice = await _showPrecheckModal(
+            'Stale Output Folders Detected',
+            status.stale_jobs.length + ' of ' + status.queue_length + ' queued job(s) have existing output files. How should the queue handle them?',
+            [
+                { label: 'Cancel Queue', cls: 'btn-ghost', value: 'cancel' },
+                { label: 'Decide per Job', cls: 'btn-secondary', value: 'per_job' },
+                { label: 'Skip Clearing for All', cls: 'btn-secondary', value: 'all_keep' },
+                { label: 'Clear All & Run', cls: 'btn-primary', value: 'all_clear' },
+            ],
+            status.stale_jobs
+        );
+
+        if (choice === 'cancel') return 'cancel';
+
+        window._queuePrecheckState.mode = choice;
+        window._queuePrecheckState.decisions = {};
+
+        if (choice === 'all_clear') {
+            // Clear all stale outputs now
+            for (const job of status.stale_jobs) {
+                await _clearJobOutput(job.name);
+            }
+            showToast('Cleared output for ' + status.stale_jobs.length + ' job(s). Queue starting.');
+        } else if (choice === 'all_keep') {
+            showToast('Queue starting without clearing outputs.');
+        } else if (choice === 'per_job') {
+            // Per-job decisions happen as each job becomes current. For now,
+            // pre-collect decisions via a series of prompts.
+            for (const job of status.stale_jobs) {
+                const sub = await _showPrecheckModal(
+                    'Output for: ' + job.name,
+                    'This job has ' + job.file_count + ' existing output file(s). Clear?',
+                    [
+                        { label: 'Skip Clear', cls: 'btn-secondary', value: 'keep' },
+                        { label: 'Clear', cls: 'btn-primary', value: 'clear' },
+                    ],
+                    null
+                );
+                window._queuePrecheckState.decisions[job.name] = sub;
+                if (sub === 'clear') {
+                    await _clearJobOutput(job.name);
+                }
+            }
+            showToast('Per-job decisions recorded. Queue starting.');
+        }
+        return 'proceed';
+    } catch (err) {
+        console.warn('Queue precheck failed:', err);
+        return 'proceed'; // don't block on errors
+    }
+}
+
+// Wrap addToQueue to trigger precheck on FIRST add (when queue was empty)
+(function wrapAddToQueue() {
+    function attach() {
+        if (typeof addToQueue !== 'function') {
+            setTimeout(attach, 500);
+            return;
+        }
+        if (addToQueue._precheckWrapped) return;
+        const original = addToQueue;
+        window.addToQueue = async function(...args) {
+            const result = await original.apply(this, args);
+            // Check queue state right after adding
+            try {
+                const queue = await api('/api/queue');
+                if (queue && queue.length === 1) {
+                    // First job just added - run bulk precheck
+                    await _runQueuePrecheck();
+                }
+            } catch (e) {
+                console.warn('Post-queue-add precheck failed:', e);
+            }
+            return result;
+        };
+        window.addToQueue._precheckWrapped = true;
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', attach);
+    else attach();
+})();
+// === END ANIMA OUTPUT PRECHECK PATCH ===
+
+
+// === ANIMA PROGRESS BAR PATCH ===
+window._jobStates = window._jobStates || {};
+
+function _renderJobState(jobItem, state) {
+    // jobItem is the .job-item element; state is the state object for that job
+    if (!jobItem || !state) return;
+
+    // Remove any existing progress/status markup we added previously
+    const existing = jobItem.querySelector('.job-progress-wrapper, .job-status-label');
+    if (existing) existing.remove();
+    // Remove ALL previously added state markup
+    jobItem.querySelectorAll('.job-progress-wrapper, .job-status-label').forEach(el => el.remove());
+
+    if (state.state === 'training') {
+        const pct = state.percent || 0;
+        const wrap = document.createElement('div');
+        wrap.className = 'job-progress-wrapper';
+        wrap.innerHTML =
+            '<div class="job-progress-bar"><div class="job-progress-fill" style="width: ' + pct + '%;"></div></div>' +
+            '<div class="job-progress-text">' + pct + '%</div>';
+        jobItem.appendChild(wrap);
+    } else if (state.state === 'completed') {
+        const lbl = document.createElement('div');
+        lbl.className = 'job-status-label job-status-completed';
+        lbl.textContent = '✓ Completed';
+        jobItem.appendChild(lbl);
+    } else if (state.state === 'failed') {
+        const lbl = document.createElement('div');
+        lbl.className = 'job-status-label job-status-failed';
+        lbl.textContent = '⚠ Failed';
+        jobItem.appendChild(lbl);
+    } else if (state.state === 'awaiting') {
+        const lbl = document.createElement('div');
+        lbl.className = 'job-status-label job-status-awaiting';
+        lbl.textContent = 'Awaiting';
+        jobItem.appendChild(lbl);
+    } else {
+        const lbl = document.createElement('div');
+        lbl.className = 'job-status-label job-status-idle';
+        lbl.textContent = 'Idle';
+        jobItem.appendChild(lbl);
+    }
+}
+
+function _applyAllJobStates() {
+    // Re-render every job tile in the sidebar based on cached state
+    const items = document.querySelectorAll('.job-item');
+    items.forEach(item => {
+        const jobName = item.dataset.job || item.dataset.name || item.textContent.trim().split('\n')[0].trim();
+        if (jobName && window._jobStates[jobName]) {
+            _renderJobState(item, window._jobStates[jobName]);
+        }
+    });
+}
+
+async function _refreshAllJobStates() {
+    try {
+        const result = await api('/api/jobs/states');
+        if (result && result.states) {
+            window._jobStates = result.states;
+            _applyAllJobStates();
+        }
+    } catch (e) {
+        console.warn('Failed to refresh job states:', e);
+    }
+}
+
+// Hook the WebSocket handler for live progress updates
+(function hookProgressWS() {
+    function attach() {
+        if (!window.ws && !window.socket) {
+            setTimeout(attach, 500);
+            return;
+        }
+    }
+    attach();
+    // Initial state load + periodic refresh
+    setTimeout(_refreshAllJobStates, 1000);
+    setInterval(_refreshAllJobStates, 5000);
+})();
+
+// MutationObserver to re-render states when the job list updates
+(function observeJobList() {
+    function attach() {
+        const list = document.querySelector('.jobs-list, #job-list, [class*="jobs"]');
+        if (!list) {
+            setTimeout(attach, 1000);
+            return;
+        }
+        const obs = new MutationObserver(() => {
+            setTimeout(_applyAllJobStates, 50);
+        });
+        obs.observe(list, { childList: true, subtree: true });
+        _applyAllJobStates();
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', attach);
+    else attach();
+})();
+// === END ANIMA PROGRESS BAR PATCH ===
 
 // ==========================================
 //  Init

@@ -84,6 +84,173 @@ if (!fs.existsSync(GLOBAL_CONFIG_PATH) && fs.existsSync(TEMPLATE_CONFIG_PATH)) {
 
 // Track running processes
 const runningJobs = new Map();
+// === ANIMA PROGRESS BAR PATCH ===
+const jobProgress = new Map(); // jobName -> { current, total, percent, state }
+
+function _parseStepLine(line) {
+    // Match patterns like: "steps:  45%|####     | 990/2200 [05:21<06:32, 3.08it/s]"
+    const m = line.match(/(\d+)\s*\/\s*(\d+)\s*\[/);
+    if (m) {
+        const current = parseInt(m[1]);
+        const total = parseInt(m[2]);
+        if (total > 0) {
+            return { current, total, percent: Math.floor((current / total) * 100) };
+        }
+    }
+    return null;
+}
+
+function _broadcastProgress(jobName, data) {
+    const msg = JSON.stringify({
+        type: 'job_progress',
+        data: { name: jobName, ...data }
+    });
+    wss.clients.forEach(ws => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+    });
+}
+
+function _trackProgressFromLog(jobName, buffer) {
+    const text = buffer.toString();
+    const lines = text.split(/\r?\n|\r/);
+    for (const line of lines) {
+        const parsed = _parseStepLine(line);
+        if (parsed) {
+            jobProgress.set(jobName, {
+                ...parsed,
+                state: 'training'
+            });
+            _broadcastProgress(jobName, { ...parsed, state: 'training' });
+            return;
+        }
+    }
+}
+
+// Determine job state from filesystem (called for non-training jobs)
+function _getJobState(jobName) {
+    const safe = sanitizeName(jobName);
+
+    // If currently training, that takes priority
+    if (runningJobs.has(safe)) {
+        const cached = jobProgress.get(safe);
+        if (cached) return { name: safe, ...cached, state: 'training' };
+        return { name: safe, current: 0, total: 0, percent: 0, state: 'training' };
+    }
+
+    // Check queue
+    if (typeof jobQueue !== 'undefined' && Array.isArray(jobQueue) && jobQueue.includes(safe)) {
+        return { name: safe, state: 'awaiting' };
+    }
+
+    // Check filesystem for completion
+    const outputDir = path.join(getJobPath(safe), 'output');
+    const finalFile = path.join(outputDir, safe + '.safetensors');
+    if (fs.existsSync(finalFile)) {
+        return { name: safe, state: 'completed' };
+    }
+
+    // Check for failed: existence of any step files but no final
+    if (fs.existsSync(outputDir)) {
+        try {
+            const files = fs.readdirSync(outputDir);
+            const hasStepFiles = files.some(f => f.includes('-step') && f.endsWith('.safetensors'));
+            if (hasStepFiles) {
+                return { name: safe, state: 'failed' };
+            }
+        } catch (e) {}
+    }
+
+    return { name: safe, state: 'idle' };
+}
+
+// Return states for all jobs
+app.get('/api/jobs/states', (req, res) => {
+    try {
+        if (!fs.existsSync(JOBS_DIR)) return res.json({ states: {} });
+        const subs = fs.readdirSync(JOBS_DIR, { withFileTypes: true })
+            .filter(d => d.isDirectory())
+            .map(d => d.name);
+        const states = {};
+        for (const name of subs) {
+            states[name] = _getJobState(name);
+        }
+        res.json({ states });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+// === END ANIMA PROGRESS BAR PATCH ===
+
+// === ANIMA QUEUE PATCH ===
+const QUEUE_PATH = path.join(__dirname, 'queue.json');
+let jobQueue = [];
+let queueRunning = false;
+
+function saveQueue() {
+    try { fs.writeFileSync(QUEUE_PATH, JSON.stringify(jobQueue), 'utf8'); }
+    catch (e) { console.error('[Queue] Failed to save:', e.message); }
+}
+
+function loadQueueFromDisk() {
+    if (fs.existsSync(QUEUE_PATH)) {
+        try { jobQueue = JSON.parse(fs.readFileSync(QUEUE_PATH, 'utf8')) || []; }
+        catch (e) { jobQueue = []; }
+    }
+}
+
+function broadcastQueueUpdate() {
+    const data = JSON.stringify({ type: 'queue_update', data: jobQueue });
+    wss.clients.forEach(ws => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(data);
+    });
+}
+
+function processQueue() {
+    if (queueRunning || jobQueue.length === 0) return;
+    for (const [, job] of runningJobs) {
+        if (job.type === 'training') return;
+    }
+    queueRunning = true;
+    const jobName = jobQueue.shift();
+    saveQueue();
+    broadcastQueueUpdate();
+    console.log(`[Queue] Starting: ${jobName}`);
+
+    const jobPath = getJobPath(jobName);
+    const configPath = path.join(jobPath, 'config.toml');
+    if (!fs.existsSync(configPath)) {
+        console.warn(`[Queue] Job not found: ${jobName}, skipping.`);
+        queueRunning = false;
+        setTimeout(processQueue, 1000);
+        return;
+    }
+
+    const http2 = require('http');
+    const postData = JSON.stringify({});
+    const options = {
+        hostname: '127.0.0.1',
+        port: server.address() ? server.address().port : DEFAULT_PORT,
+        path: `/api/jobs/${encodeURIComponent(jobName)}/train/start`,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(postData) }
+    };
+    const req = http2.request(options, (res) => {
+        let body = '';
+        res.on('data', d => body += d);
+        res.on('end', () => console.log(`[Queue] ${jobName} response: ${body.substring(0, 200)}`));
+    });
+    req.on('error', (e) => {
+        console.error(`[Queue] Failed to start ${jobName}:`, e.message);
+        queueRunning = false;
+        setTimeout(processQueue, 5000);
+    });
+    req.write(postData);
+    req.end();
+}
+
+loadQueueFromDisk();
+// === END ANIMA QUEUE PATCH ===
+
 
 // WebSocket clients per job
 const wsClients = new Map(); // jobName -> Set<ws>
@@ -1611,12 +1778,24 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         logStream.on('error', (err) => console.error(`[Train/LogFile] ${err.message}`));
 
         proc.on('close', (code) => {
+            // === PROGRESS PATCH: clear in-progress state on training end ===
+            try {
+                if (code === 0) {
+                    jobProgress.delete(jobName);
+                    _broadcastProgress(jobName, { state: 'completed' });
+                } else {
+                    jobProgress.delete(jobName);
+                    _broadcastProgress(jobName, { state: 'failed' });
+                }
+            } catch(e) {}
             const msg = `\n--- Training ${code === 0 ? 'completed' : 'stopped'} (exit code: ${code}) ---\n`;
             logStream.write(msg);
             logStream.end();
             appendLog(Buffer.from(msg));
             runningJobs.delete(jobName);
             broadcastStatus(jobName, 'idle');
+            queueRunning = false;
+            setTimeout(processQueue, 3000);
         });
 
         proc.on('error', (err) => {
@@ -1684,6 +1863,7 @@ app.post('/api/jobs/:name/tensorboard', (req, res) => {
         const proc = spawnShell(tbScript, ROOT_DIR);
 
         proc.stderr.on('data', (data) => {
+            try { _trackProgressFromLog(jobName, data); } catch(e) {}
             const text = data.toString();
             console.log(`[TensorBoard/${jobName}] ${text.trim()}`);
         });
@@ -1932,6 +2112,286 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason, promise) => {
     console.error('CRITICAL ERROR (Unhandled Rejection) at:', promise, 'reason:', reason);
 });
+
+
+// --- Queue API ---
+app.get('/api/queue', (req, res) => {
+    res.json(jobQueue);
+});
+
+app.post('/api/queue', (req, res) => {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ error: 'Name required' });
+    if (jobQueue.includes(name)) return res.status(409).json({ error: 'Already in queue' });
+    jobQueue.push(name);
+    saveQueue();
+    broadcastQueueUpdate();
+    setTimeout(processQueue, 500);
+    res.json({ success: true, queue: jobQueue });
+});
+
+app.delete('/api/queue/:name', (req, res) => {
+    const name = decodeURIComponent(req.params.name);
+    jobQueue = jobQueue.filter(j => j !== name);
+    saveQueue();
+    broadcastQueueUpdate();
+    res.json({ success: true, queue: jobQueue });
+});
+
+app.put('/api/queue', (req, res) => {
+    const { queue } = req.body;
+    if (!Array.isArray(queue)) return res.status(400).json({ error: 'Invalid queue' });
+    jobQueue = queue;
+    saveQueue();
+    broadcastQueueUpdate();
+    res.json({ success: true });
+});
+
+app.delete('/api/queue', (req, res) => {
+    jobQueue = [];
+    saveQueue();
+    broadcastQueueUpdate();
+    res.json({ success: true });
+});
+
+
+// === ANIMA LORA SYNC V2 PATCH ===
+function _findLoraFiles(jobName, mode) {
+    // mode: 'final' or 'all'
+    const safeName = sanitizeName(jobName);
+    const jobPath = getJobPath(safeName);
+    const outputDir = path.join(jobPath, 'output');
+
+    if (!fs.existsSync(outputDir)) return [];
+
+    const finalFile = `${safeName}.safetensors`;
+    const stepPrefix = `${safeName}-step`;
+
+    const allFiles = fs.readdirSync(outputDir).filter(f => f.endsWith('.safetensors'));
+
+    if (mode === 'final') {
+        return allFiles.filter(f => f === finalFile).map(f => path.join(outputDir, f));
+    } else {
+        // 'all' = final + step checkpoints
+        return allFiles
+            .filter(f => f === finalFile || f.startsWith(stepPrefix))
+            .map(f => path.join(outputDir, f));
+    }
+}
+
+function _syncFiles(files, destFolder) {
+    const result = { copied: [], skipped: [], errors: [] };
+
+    if (!files || files.length === 0) {
+        return result;
+    }
+
+    try {
+        if (!fs.existsSync(destFolder)) {
+            fs.mkdirSync(destFolder, { recursive: true });
+        }
+    } catch (e) {
+        result.errors.push({ file: destFolder, error: `Could not create destination: ${e.message}` });
+        return result;
+    }
+
+    for (const src of files) {
+        const baseName = path.basename(src);
+        const dest = path.join(destFolder, baseName);
+        if (fs.existsSync(dest)) {
+            result.skipped.push(baseName);
+            continue;
+        }
+        try {
+            fs.copyFileSync(src, dest);
+            const stat = fs.statSync(dest);
+            result.copied.push({ name: baseName, size: stat.size });
+        } catch (e) {
+            result.errors.push({ file: baseName, error: e.message });
+        }
+    }
+    return result;
+}
+
+function _resolveDestFolder(baseDest, jobName, useSubfolder) {
+    if (useSubfolder) {
+        return path.join(baseDest, jobName);
+    }
+    return baseDest;
+}
+
+app.post('/api/jobs/:name/sync', (req, res) => {
+    try {
+        const mode = (req.body && req.body.mode) || 'final';
+        const useSubfolderOverride = req.body && (req.body.use_subfolder !== undefined) ? !!req.body.use_subfolder : null;
+
+        const globalConfig = getGlobalConfig();
+        const baseDest = globalConfig.lora_sync_destination;
+        if (!baseDest || !baseDest.trim()) {
+            return res.status(400).json({ error: 'LoRA Sync Destination not set. Set it in Global Settings.' });
+        }
+
+        const globalSubfolder = !!globalConfig.lora_sync_create_subfolder;
+        const useSubfolder = useSubfolderOverride !== null ? useSubfolderOverride : globalSubfolder;
+
+        const jobName = sanitizeName(req.params.name);
+        const files = _findLoraFiles(jobName, mode);
+        if (files.length === 0) {
+            return res.json({ success: true, mode, copied: [], skipped: [], missing: true, message: `No matching .safetensors files found for ${jobName}` });
+        }
+
+        const destFolder = _resolveDestFolder(baseDest, jobName, useSubfolder);
+        const result = _syncFiles(files, destFolder);
+        res.json({ success: true, mode, jobName, destination: destFolder, ...result });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/sync-all', (req, res) => {
+    try {
+        const mode = (req.body && req.body.mode) || 'final';
+        const useSubfolderOverride = req.body && (req.body.use_subfolder !== undefined) ? !!req.body.use_subfolder : null;
+
+        const globalConfig = getGlobalConfig();
+        const baseDest = globalConfig.lora_sync_destination;
+        if (!baseDest || !baseDest.trim()) {
+            return res.status(400).json({ error: 'LoRA Sync Destination not set. Set it in Global Settings.' });
+        }
+
+        const globalSubfolder = !!globalConfig.lora_sync_create_subfolder;
+        const useSubfolder = useSubfolderOverride !== null ? useSubfolderOverride : globalSubfolder;
+
+        if (!fs.existsSync(JOBS_DIR)) {
+            return res.json({ jobs: [], totals: { copied: 0, skipped: 0, missing: 0, errors: 0 } });
+        }
+
+        const subfolders = fs.readdirSync(JOBS_DIR, { withFileTypes: true })
+            .filter(d => d.isDirectory())
+            .map(d => d.name)
+            .sort();
+
+        const jobResults = [];
+        let totalCopied = 0;
+        let totalSkipped = 0;
+        let totalMissing = 0;
+        let totalErrors = 0;
+
+        for (const name of subfolders) {
+            const files = _findLoraFiles(name, mode);
+            if (files.length === 0) {
+                jobResults.push({ name, status: 'missing' });
+                totalMissing++;
+                continue;
+            }
+            const destFolder = _resolveDestFolder(baseDest, name, useSubfolder);
+            const r = _syncFiles(files, destFolder);
+            jobResults.push({ name, ...r, destination: destFolder });
+            totalCopied += r.copied.length;
+            totalSkipped += r.skipped.length;
+            totalErrors += r.errors.length;
+        }
+
+        res.json({
+            mode,
+            destination: baseDest,
+            useSubfolder,
+            jobs: jobResults,
+            totals: { copied: totalCopied, skipped: totalSkipped, missing: totalMissing, errors: totalErrors }
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+// === END ANIMA LORA SYNC V2 PATCH ===
+
+
+// === ANIMA OUTPUT PRECHECK PATCH ===
+function _scanOutputFolder(jobName) {
+    const safe = sanitizeName(jobName);
+    const outputDir = path.join(getJobPath(safe), 'output');
+    if (!fs.existsSync(outputDir)) {
+        return { exists: false, file_count: 0, files: [] };
+    }
+    try {
+        const files = fs.readdirSync(outputDir).filter(f => {
+            const full = path.join(outputDir, f);
+            try { return fs.statSync(full).isFile(); } catch (e) { return false; }
+        });
+        return { exists: true, file_count: files.length, files: files };
+    } catch (e) {
+        return { exists: false, file_count: 0, files: [], error: e.message };
+    }
+}
+
+function _clearOutputFolder(jobName) {
+    const safe = sanitizeName(jobName);
+    const outputDir = path.join(getJobPath(safe), 'output');
+    if (!fs.existsSync(outputDir)) {
+        return { deleted: 0, errors: [] };
+    }
+    let deleted = 0;
+    const errors = [];
+    try {
+        const entries = fs.readdirSync(outputDir);
+        for (const entry of entries) {
+            const full = path.join(outputDir, entry);
+            try {
+                const st = fs.statSync(full);
+                if (st.isFile()) {
+                    fs.unlinkSync(full);
+                    deleted++;
+                } else if (st.isDirectory()) {
+                    fs.rmSync(full, { recursive: true, force: true });
+                    deleted++;
+                }
+            } catch (e) {
+                errors.push({ entry, error: e.message });
+            }
+        }
+    } catch (e) {
+        errors.push({ entry: '(scan)', error: e.message });
+    }
+    return { deleted, errors };
+}
+
+// Check a single job's output folder
+app.get('/api/jobs/:name/output-status', (req, res) => {
+    try {
+        const r = _scanOutputFolder(req.params.name);
+        res.json(r);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Clear a single job's output folder
+app.post('/api/jobs/:name/clear-output', (req, res) => {
+    try {
+        const r = _clearOutputFolder(req.params.name);
+        res.json({ success: true, ...r });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Scan all queued jobs for stale outputs (used by queue precheck)
+app.get('/api/queue/output-status', (req, res) => {
+    try {
+        const queue = (typeof jobQueue !== 'undefined' && Array.isArray(jobQueue)) ? jobQueue : [];
+        const stale = [];
+        for (const name of queue) {
+            const r = _scanOutputFolder(name);
+            if (r.exists && r.file_count > 0) {
+                stale.push({ name, file_count: r.file_count });
+            }
+        }
+        res.json({ queue_length: queue.length, stale_count: stale.length, stale_jobs: stale });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+// === END ANIMA OUTPUT PRECHECK PATCH ===
 
 // --- Start Server ---
 
